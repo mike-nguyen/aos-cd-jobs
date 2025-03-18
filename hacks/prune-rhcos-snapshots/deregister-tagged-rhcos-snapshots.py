@@ -23,7 +23,7 @@ AmiId = str
 
 if __name__ == '__main__':
 
-    client = boto3.client('ec2')
+    client = boto3.client('ec2', region_name='us-east-1')
     all_aws_regions = [region['RegionName'] for region in client.describe_regions()['Regions']]
 
     production_count = 0
@@ -55,6 +55,10 @@ if __name__ == '__main__':
 
         if len(list(impossible_images)) > 0:
             print(f'Found production images tagged with {AMI_TAG_KEY_GARBAGE_COLLECT}. Correct this before proceeding.')
+            for image in impossible_images:
+                image_id = image['ImageId']
+                image_name = image.get('Name', None)
+                print(f'Impossible Image: {image_id} {image_name}')
             exit(1)
 
         gc_images = list(region_client.describe_images(
@@ -93,6 +97,7 @@ if __name__ == '__main__':
         print(f'Planning to deregister {len(gc_images)} AMIs from {aws_region}')
         for image in gc_images:
             image_id = image['ImageId']
+            image_name = image.get('Name', None)
             image_resource = ec_resource.Image(image_id)
 
             for block_device_mapping in image['BlockDeviceMappings']:
@@ -102,7 +107,7 @@ if __name__ == '__main__':
                     ebs_snapshot_ids.add(snapshot_id)
 
             image_resource.deregister()
-            print(f'Deregistered: {image_id}')
+            print(f'Deregistered: {image_id} {image_name}')
 
         # delete referenced snapshots
         for snapshot_id in ebs_snapshot_ids:

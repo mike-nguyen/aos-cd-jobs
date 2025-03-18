@@ -9,6 +9,7 @@ import datetime
 import urllib3
 import pathlib
 import subprocess
+import time
 
 # Set to "true" if an AMI is selected for garbage collection
 AMI_TAG_KEY_GARBAGE_COLLECT = 'garbage_collect'
@@ -16,6 +17,8 @@ AMI_TAG_KEY_GARBAGE_COLLECT = 'garbage_collect'
 # Set to "true" if an AMI is mentioned in installer reference
 AMI_TAG_KEY_PRODUCTION = 'production'
 
+# Set to "true" if an AMI to ignore CSO
+AMI_TAG_KEY_CSO_IGNORE = 'cso-ignore'
 
 def create_recycle_bin_rule(client, res_type: str):
     response = client.create_rule(
@@ -87,14 +90,12 @@ if __name__ == '__main__':
 
     client = boto3.client('ec2', region_name='us-east-1')
     all_aws_regions = [region['RegionName'] for region in client.describe_regions()['Regions']]
-
     ignore_amis_younger_than = datetime.datetime.now() - datetime.timedelta(days=30)
-
     ami_analysis = dict()
     all_amis: Set[AmiId] = set()
     production_to_preserve: Set[AmiId] = set()
     young_amis_to_preserve: Set[AmiId] = set()
-
+    mislabeled_prod_images = 0
     for aws_region in all_aws_regions:
         region_ami_analysis = dict()
         ami_analysis[aws_region] = region_ami_analysis
@@ -112,8 +113,11 @@ if __name__ == '__main__':
         ec_resource = boto3.resource('ec2', region_name=aws_region)
         print(f'Querying for AMIs in {aws_region}..')
         images = region_client.describe_images(Owners=['self']).get('Images')
-
+        print(f'Number of images in {aws_region}: {len(images)}')
+        images_left = len(images)
         for image in images:
+            images_left = images_left - 1
+            print(f'Images left: {images_left}')
             image_id = image['ImageId']
             image_name = image.get('Name', None)
             image_description = image.get('Description', None)
@@ -127,6 +131,24 @@ if __name__ == '__main__':
             if AMI_TAG_KEY_PRODUCTION in image_tag_keys:
                 production_to_preserve.add(image_id)
                 print(f'    AMI is labeled with {AMI_TAG_KEY_PRODUCTION}; preserving.')
+                image_resource = ec_resource.Image(image_id)
+                image_resource.create_tags(
+                    Tags=[
+                        {
+                            'Key': AMI_TAG_KEY_CSO_IGNORE,
+                            'Value': 'production EBS snapshot',
+                        },
+                    ]
+                )
+                if AMI_TAG_KEY_GARBAGE_COLLECT in image_tag_keys:
+                    print(f'IN THE IMPOSSIBLE ZONE')
+                    for tag_entry in image_tags:
+                        if tag_entry['Key'] == AMI_TAG_KEY_GARBAGE_COLLECT:
+                            print(f'{tag_entry['Key']} found in prod image {image_id} {image_name}!')
+                            #exit(1)  # DEBUG DEBUG DEBUG
+                            tag = ec_resource.Tag(image_id, AMI_TAG_KEY_GARBAGE_COLLECT, tag_entry['Value'])
+                            tag.delete()
+                            mislabeled_prod_images = mislabeled_prod_images + 1
                 continue
 
             preserve_ami = False
@@ -134,17 +156,23 @@ if __name__ == '__main__':
             # unlikely case of an AMI within the same name in our account in two different
             # regions. The worst case scenario is an unnecessary preservation.
             if image_id in amis_in_use:
+                print(f'    AMI {image_id} in use without production tag. Adding tag')
                 preserve_ami = True
                 production_to_preserve.add(image_id)
                 image_resource = ec_resource.Image(image_id)
-                image_resource.create_tags(
+                response = image_resource.create_tags(
                     Tags=[
                         {
                             'Key': AMI_TAG_KEY_PRODUCTION,
                             'Value': 'true',
                         },
+                        {
+                            'Key': AMI_TAG_KEY_CSO_IGNORE,
+                            'Value': 'production EBS snapshot',
+                        },
                     ]
                 )
+                print(f'{response}:  Added tag')
 
             creation_datetime = datetime.datetime.strptime(image_creation, "%Y-%m-%dT%H:%M:%S.%fZ")
 
@@ -152,7 +180,7 @@ if __name__ == '__main__':
                 print(f'AMI {image_id} will be preserved due to recent creation')
                 young_amis_to_preserve.add(image_id)
                 preserve_ami = True
-
+            print(f'registering {image_id}')
             # Register pruning information for this image
             region_ami_analysis[image_id] = {
                 'name': image_name,
@@ -171,7 +199,7 @@ if __name__ == '__main__':
                         ebs_snapshots.append(snapshot_id)
 
                 region_ami_analysis[image_id]['snapshots'] = ebs_snapshots
-
+                print(f'AMI {image_id} is not in any commits. Associated snapshot is {snapshot_id}')
                 if AMI_TAG_KEY_GARBAGE_COLLECT not in image_tag_keys:
                     image_resource = ec_resource.Image(image_id)
                     image_resource.create_tags(
@@ -184,17 +212,20 @@ if __name__ == '__main__':
                     )
                     print(f'labeled {image_id} in {aws_region}')
             else:
+                print(f'erroneously tagged {image_id}: {image_name} in {aws_region}')
                 # If an image was erroneously tagged, delete the tag.
                 if AMI_TAG_KEY_GARBAGE_COLLECT in image_tag_keys:
                     for tag_entry in image_tags:
                         if tag_entry['Key'] == AMI_TAG_KEY_GARBAGE_COLLECT:
-                            exit(0)  # DEBUG DEBUG DEBUG
+                            print(f'{tag_entry['Key']} found!')
+                            exit(1)  # DEBUG DEBUG DEBUG
                             tag = ec_resource.Tag(image_id, AMI_TAG_KEY_GARBAGE_COLLECT, tag_entry['Value'])
                             tag.delete()
+                            mislabeled_prod_images = mislabeled_prod_images + 1
 
             print(f'Assessed: {image_id}')
             print(yaml.dump(region_ami_analysis[image_id]))
-
+    print(f'Found {mislabeled_prod_images} prod images with garbage collection tag')
     print(f'Found a total of {len(all_amis)} in account')
     print(f'Detected {len(young_amis_to_preserve)} young AMIs to preserve')
     print(f'Installer commits suggest {len(amis_in_use)} AMIs need to be preserved')
