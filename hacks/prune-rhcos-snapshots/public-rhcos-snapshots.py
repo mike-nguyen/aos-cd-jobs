@@ -95,7 +95,7 @@ if __name__ == '__main__':
         release_branch = release_branch.strip()
         print(f'Processing branch: {release_branch}')
 
-        for rhcos_path in ('data/data/coreos/rhcos.json', 'data/data/rhcos.json'):
+        for rhcos_path in ('data/data/coreos/rhcos.json', 'data/data/rhcos.json', 'data/data/coreos/scos.json'):
             gitshow_process = subprocess.run(
                 ['git', '-C', str(installer_git_path), 'log', '--format=%H', release_branch, '--', rhcos_path],
                 capture_output=True)
